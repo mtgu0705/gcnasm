@@ -54,6 +54,98 @@ __global__ void cvt_i4x8_fp8x8(const void* ptr_input_i4, void* ptr_out_i8, int p
     reinterpret_cast<uint32_t*>(ptr_out_i8)[cur_pixel * 2 + 1] = fp8x4_1;
 }
 
+__device__ inline uint32_t i4x4_fp8x4(int q)
+{
+        // [0, 1, 2, 3] encoded as FP8
+        static constexpr uint32_t POS_E4M3s_REG1 = 0x2C282000;
+        // [4, 5, 6, 7] encoded as FP8
+        static constexpr uint32_t POS_E4M3s_REG2 = 0x36343230;
+        // [-8, -7, -6, -5] encoded as FP8
+        static constexpr uint32_t NEG_E4M3s_REG1 = 0xB2B4B6B8;
+        // [-4, -3, -2, -1] encoded as FP8
+        static constexpr uint32_t NEG_E4M3s_REG2 = 0xA0A8ACB0;
+    
+        uint32_t tmp_pos, tmp_neg, tmp_res;
+    
+        uint32_t sign= q & 0x08080808;
+        uint32_t dict_sel = q & 0x07070707;
+        uint32_t final_sel = 0x03020100 | (sign >> 1);
+
+        tmp_pos = __builtin_amdgcn_perm(POS_E4M3s_REG2, POS_E4M3s_REG1, dict_sel);
+        tmp_neg = __builtin_amdgcn_perm(NEG_E4M3s_REG2, NEG_E4M3s_REG1, dict_sel);
+        tmp_res = __builtin_amdgcn_perm(tmp_neg, tmp_pos, final_sel);
+
+        return tmp_res;
+}
+
+template <int BLOCK_SIZE = 256>
+__global__ void cvt_i4x8_fp8x8_v2(const void* ptr_input_i4, void* ptr_out_i8, int pixels)
+{
+    int cur_pixel = blockIdx.x * BLOCK_SIZE + threadIdx.x;
+    if(cur_pixel * 8 > pixels)
+        return;
+    int i4x8 = reinterpret_cast<const int*>(ptr_input_i4)[cur_pixel];
+    uint32_t fp8x4[2];
+
+#if 0
+    uint32_t tmp_pos, tmp_neg;
+
+    // [0, 1, 2, 3] encoded as FP8
+    static constexpr uint32_t POS_E4M3s_REG1 = 0x2C282000;
+    // [4, 5, 6, 7] encoded as FP8
+    static constexpr uint32_t POS_E4M3s_REG2 = 0x36343230;
+    // [-8, -7, -6, -5] encoded as FP8
+    static constexpr uint32_t NEG_E4M3s_REG1 = 0xB2B4B6B8;
+    // [-4, -3, -2, -1] encoded as FP8
+    static constexpr uint32_t NEG_E4M3s_REG2 = 0xA0A8ACB0;
+
+    uint32_t sign= i4x8 & 0x08080808;
+    uint32_t dict_sel = i4x8 & 0x07070707;
+    uint32_t final_sel = 0x03020100 | (sign >> 1);
+
+    tmp_pos = __builtin_amdgcn_perm(POS_E4M3s_REG2, POS_E4M3s_REG1, dict_sel);
+    tmp_neg = __builtin_amdgcn_perm(NEG_E4M3s_REG2, NEG_E4M3s_REG1, dict_sel);
+    fp8x4[0] = __builtin_amdgcn_perm(tmp_neg, tmp_pos, final_sel);
+
+    sign = (i4x8>>4)&0x08080808;
+    dict_sel = (i4x8>>4)&0x07070707;
+    final_sel = 0x03020100 | (sign >> 1);
+
+    tmp_pos = __builtin_amdgcn_perm(POS_E4M3s_REG2, POS_E4M3s_REG1, dict_sel);
+    tmp_neg = __builtin_amdgcn_perm(NEG_E4M3s_REG2, NEG_E4M3s_REG1, dict_sel);
+    fp8x4[1] = __builtin_amdgcn_perm(tmp_neg, tmp_pos, final_sel);
+#else
+    fp8x4[0] = i4x4_fp8x4(i4x8);
+    fp8x4[1] = i4x4_fp8x4(i4x8 >> 4);
+#endif
+
+    // #pragma unroll
+    // for (int it = 0; it < 2; it++, i4x8 >>= 4)
+    // {
+    //     uint32_t sign = i4x8 & 0x08080808;
+    //     uint32_t dict_sel = i4x8 & 0x07070707;
+    //     uint32_t final_sel = 0x03020100 | (sign >> 1);
+
+    //     asm volatile(
+    //         " v_perm_b32 %[v_tmp_pos], %[pos_reg2], %[pos_reg1], %[dict_sel]\n"
+    //         " v_perm_b32 %[v_tmp_neg], %[neg_reg2], %[neg_reg1], %[dict_sel]\n"
+    //         " v_perm_b32 %[v_dst], %[v_tmp_neg], %[v_tmp_pos], %[final_sel]\n"
+    //         : [v_dst]"+v"(fp8x4[it]), [v_tmp_pos]"+v"(tmp_pos), [v_tmp_neg]"+v"(tmp_neg)
+    //         : [pos_reg1]"v"(POS_E4M3s_REG1), [pos_reg2]"v"(POS_E4M3s_REG2),
+    //           [neg_reg1]"v"(NEG_E4M3s_REG1), [neg_reg2]"v"(NEG_E4M3s_REG2),
+    //           [dict_sel]"v"(dict_sel), [final_sel]"v"(final_sel)
+    //     );
+        
+    //     // printf("tid:%d\n", static_cast<int>(threadIdx.x));
+    //     // printf("tid:%d, i4x8:0x%x, iteration:%d, sign:0x%x, dict_sel:0x%x, final_sel:0x%x, tmp_pos:0x%x, tmp_neg:0x%x, fp8x4:0x%x\n", static_cast<int>(threadIdx.x), i4x8, i, sign, dict_sel, final_sel, tmp_pos, tmp_neg, fp8x4[i]);    
+    // }
+
+    // printf("tid:%d, i4x8:0x%x, 0:%f, 1:%f, ->%x, %x\n", static_cast<int>(threadIdx.x), i4x8, tmp_0, tmp_1, fp8x4_0, fp8x4_1);
+
+    reinterpret_cast<uint32_t*>(ptr_out_i8)[cur_pixel * 2 + 0] = fp8x4[0];
+    reinterpret_cast<uint32_t*>(ptr_out_i8)[cur_pixel * 2 + 1] = fp8x4[1];
+}
+
 float fp8_e4m3fnuz_to_fp32_raw(uint8_t fp8_raw)
 {
     constexpr int32_t exponent = 4;
@@ -160,9 +252,24 @@ static inline uint32_t perm_i4_dword(uint32_t x)
     return e0 | e2 << 4 | e4 << 8 | e6 << 12 | e1 << 16 | e3 << 20  | e5 << 24  | e7 << 28;
 }
 
+static inline uint32_t perm_i4_dwordv2(uint32_t x)
+{
+    // [e0, e4, e1, e5, e2, e6, e3, e7]
+    uint32_t e0 = (x & 0x0000000f) >> 0;
+    uint32_t e1 = (x & 0x000000f0) >> 4;
+    uint32_t e2 = (x & 0x00000f00) >> 8;
+    uint32_t e3 = (x & 0x0000f000) >> 12;
+    uint32_t e4 = (x & 0x000f0000) >> 16;
+    uint32_t e5 = (x & 0x00f00000) >> 20;
+    uint32_t e6 = (x & 0x0f000000) >> 24;
+    uint32_t e7 = (x & 0xf0000000) >> 28;
+
+    return e0 | e4 << 4 | e1 << 8 | e5 << 12 | e2 << 16 | e6 << 20  | e3 << 24  | e7 << 28;
+}
+
 void permute_i4_per_dword(uint32_t * dst_i4_dwords, const uint32_t * src_i4_dwords, int num_dwords) {
     for(int i = 0; i < num_dwords; i++) {
-        dst_i4_dwords[i] = perm_i4_dword(src_i4_dwords[i]);
+        dst_i4_dwords[i] = perm_i4_dwordv2(src_i4_dwords[i]);
     }
 }
 
@@ -196,7 +303,7 @@ int main(int argc, char ** argv)
     constexpr int block_size = 256;
     constexpr int pixels_per_block  = block_size * 8;
 
-    cvt_i4x8_fp8x8<<<(pixels + pixels_per_block - 1) / pixels_per_block, block_size>>>(device_src, device_dst, pixels);
+    cvt_i4x8_fp8x8_v2<<<(pixels + pixels_per_block - 1) / pixels_per_block, block_size>>>(device_src, device_dst, pixels);
 
     HIP_CALL(hipMemcpy(host_dst, device_dst, f8_bytes*sizeof(uint8_t), hipMemcpyDeviceToHost));
 
