@@ -216,20 +216,28 @@ void oob_test_kernel(T* __restrict__ dst, const T* __restrict__ src) {
 template<typename T, index_t force_buffer_size = sizeof(T)>
 __global__
 void oob_test_kernel_async(T* __restrict__ dst, const T* __restrict__ src) {
-    static_assert(sizeof(T) == 4);
+    static_assert(sizeof(T) == 4 || sizeof(T) == 8 || sizeof(T) == 12 || sizeof(T) == 16);
+#if defined(__gfx950__)
+
+#else
+    if constexpr (sizeof(T) != 4)
+        return ;
+#endif
+
     __shared__ float smem[256];
     smem[threadIdx.x] = 9999.f;  // arbitrary large number
     __builtin_amdgcn_s_barrier();
 
     if(blockIdx.x == 0 && threadIdx.x == 0) {
-        llvm_amdgcn_raw_buffer_load_lds(make_buffer_resource(src, force_buffer_size), SPTR(smem), sizeof(uint32_t), threadIdx.x * sizeof(float), 0, 0, 0);
+        llvm_amdgcn_raw_buffer_load_lds(make_buffer_resource(src, force_buffer_size), SPTR(smem), sizeof(T), threadIdx.x * sizeof(T), 0, 0, 0);
 
         __builtin_amdgcn_s_waitcnt(0x0f70); // vmcnt(0)
         __builtin_amdgcn_s_barrier();
 
-        float d = smem[threadIdx.x];
-
-        reinterpret_cast<float*>(dst)[threadIdx.x] = d;
+        for (int i = 0; i < sizeof(T) / sizeof(float); i++) {
+            float d = smem[threadIdx.x + i];
+            reinterpret_cast<float*>(dst)[threadIdx.x + i] = d;
+        }
     }
 }
 
@@ -284,6 +292,14 @@ struct test_oob{
 
 
 int main(int argc, char ** argv) {
+
+    bool is_gfx950 = [&](){
+        hipDeviceProp_t prop;
+        CALL(hipGetDeviceProperties(&prop, 0));
+        printf("%s\n", prop.gcnArchName);
+        return (std::string(prop.gcnArchName).find("gfx950") != std::string::npos);
+    }();
+
     printf("buffer_load_dwordx4 ------\n");
     test_oob<16, 16>{}();
     test_oob<16, 14>{}();
@@ -308,6 +324,42 @@ int main(int argc, char ** argv) {
     test_oob<4, 3>{}();
     test_oob<4, 2>{}();
     test_oob<4, 1>{}();
+
+    if (is_gfx950) {
+
+        printf("buffer_load_dwordx4_async ------\n");
+        test_oob<16, 16, true>{}();
+        test_oob<16, 14, true>{}();
+        test_oob<16, 11, true>{}();
+        test_oob<16, 8, true>{}();
+        test_oob<16, 6, true>{}();
+        test_oob<16, 4, true>{}();
+        test_oob<16, 3, true>{}();
+        test_oob<16, 2, true>{}();
+        test_oob<16, 1, true>{}();
+
+        printf("buffer_load_dwordx3_async ------\n");
+        test_oob<12, 12, true>{}();
+        test_oob<12, 11, true>{}();
+        test_oob<12, 8, true>{}();
+        test_oob<12, 6, true>{}();
+        test_oob<12, 4, true>{}();
+        test_oob<12, 3, true>{}();
+        test_oob<12, 2, true>{}();
+        test_oob<12, 1, true>{}();
+#if 0
+        // there is no x2 variation
+        printf("buffer_load_dwordx2_async ------\n");
+        test_oob<8, 8, true>{}();
+        test_oob<8, 7, true>{}();
+        test_oob<8, 6, true>{}();
+        test_oob<8, 5, true>{}();
+        test_oob<8, 4, true>{}();
+        test_oob<8, 3, true>{}();
+        test_oob<8, 2, true>{}();
+        test_oob<8, 1, true>{}();
+#endif
+    }
 
     printf("buffer_load_dword_async ------\n");
     test_oob<4, 4, true>{}();

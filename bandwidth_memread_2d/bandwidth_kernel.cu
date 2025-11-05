@@ -38,6 +38,9 @@ template<typename T>
 __device__  __forceinline__ void acc(T& v, const T& other)
 {
     constexpr int vec = sizeof(T) / sizeof(float);
+    if constexpr(vec == 1) {
+        v += other;
+    }
     if constexpr(vec == 4) {
         v.x += other.x;
         v.y += other.y;
@@ -46,27 +49,63 @@ __device__  __forceinline__ void acc(T& v, const T& other)
     }
 }
 
-// simple memread kernel implementation, launch based on CU number
-template<typename T, int UNROLL = 8>
+static inline __device__ uint32_t floatAsSortableUint(float x) {
+  uint32_t bits = __float_as_uint(x);
+  bits = (bits & 0x80000000) ? bits : ~bits & 0x7fffffff;
+  return bits;
+}
+
+template <int step>
+static inline __device__ uint32_t extractBinIdx(float x) {
+  uint32_t bits = floatAsSortableUint(x);
+
+  if constexpr (step == 0) {
+    return bits >> 26;
+  } else if constexpr (step == 1) {
+    return (bits >> 10) & 0x7ff;
+  } else {
+    return bits & 0x3ff;
+  }
+}
+
+// 1 WG 1 row
+template<typename DType, int vec = 1, int need_bin = 0>
 __global__
-void memread_kernel(T* p_src, T* p_dst, int issues_per_block, int iters)
+void memread_kernel_2d(DType* p_src, DType* p_dst, int rows, int cols, int stride)
 {
-    auto current = blockIdx.x * issues_per_block;
-    T v {};
+    int i_row = blockIdx.x;
+    p_src += i_row * stride;
+    DType v {};
+
+    __shared__ int smemHistogram[64];
+
+    int iters = cols / vec / BLOCK_SIZE;
+
     for(auto i = 0; i < iters; i++) {
-        auto offs = UNROLL * BLOCK_SIZE * i + threadIdx.x;
-        #pragma unroll
-        for(auto j = 0; j < UNROLL; j++) {
+        auto offs = threadIdx.x + i * BLOCK_SIZE;
 #if USE_NT_LOAD
-            acc(v, nt_load(p_src[current + offs]));
+        auto f = nt_load(p_src[offs]);
 #else
-            acc(v, p_src[current + offs]);
+        auto f = p_src[offs];
 #endif
-            offs += BLOCK_SIZE;
+        acc(v, f);
+
+        if constexpr (need_bin) {
+            uint32_t binIdx = extractBinIdx<0>(f);
+            // if(threadIdx.x == 0)
+            atomicAdd(&smemHistogram[binIdx], 1);
+            // smemHistogram[binIdx] = smemHistogram[binIdx] + 1;
         }
     }
 
-    constexpr int vec = sizeof(T) / sizeof(float);
+    // constexpr int vec = sizeof(T) / sizeof(float);
+    if constexpr(vec == 1) {
+        if(v == 10000) {
+            *p_dst  = v;
+            *(p_dst + threadIdx.x + blockIdx.x * BLOCK_SIZE) = smemHistogram[threadIdx.x];
+        }
+
+    }
     if constexpr(vec == 4) {
         if(v.x == 10000 && v.y == 10000 && v.z == 10000 && v.w == 10000)
             *p_dst  = v;
@@ -126,35 +165,24 @@ static inline int valid_vec(const float * vec_a, const float * vec_b, int num)
     return err_cnt;
 }
 
-template<typename VEC, int OCCUPANCY, int UNROLL>
-float bench_memread_kernel(void * B, void * A, int64_t dwords)
+template<typename DType, int vec = 1, int need_bin = 0>
+float bench_memread_kernel(void * B, void * A, int rows, int cols, int stride)
 {
     // benchmark kernel
-    int num_cu = [&](){
-        cudaDeviceProp dev_prop;
-        int dev;
-        CALL(cudaGetDevice(&dev));
-        CALL(cudaGetDeviceProperties(&dev_prop,dev ));
-        return dev_prop.multiProcessorCount;
-    }();
-
     // TODO: ignore check can even divide or not
-    int64_t pixels = dwords * 4 / sizeof(VEC);
     int bx = BLOCK_SIZE;
-    int gx = num_cu * OCCUPANCY;
-    int issues_per_block = pixels / gx;
-    int iters = issues_per_block / bx / UNROLL;
+    int gx = rows;
 
     cudaEvent_t start_ev, stop_ev;
     CALL(cudaEventCreate(&start_ev));
     CALL(cudaEventCreate(&stop_ev));
 
     for(int i=0;i<WARMUP;i++)
-        memread_kernel<VEC, UNROLL><<<gx, bx>>>(reinterpret_cast<VEC*>(B), reinterpret_cast<VEC*>(A), issues_per_block, iters);
+        memread_kernel_2d<DType, vec, need_bin><<<gx, bx>>>(reinterpret_cast<DType*>(B), reinterpret_cast<DType*>(A), rows, cols, stride);
 
     CALL(cudaEventRecord(start_ev, 0));
     for(int i=0;i<LOOP;i++)
-        memread_kernel<VEC, UNROLL><<<gx, bx>>>(reinterpret_cast<VEC*>(B), reinterpret_cast<VEC*>(A), issues_per_block, iters);
+        memread_kernel_2d<DType, vec, need_bin><<<gx, bx>>>(reinterpret_cast<DType*>(B), reinterpret_cast<DType*>(A), rows, cols, stride);
     CALL(cudaEventRecord( stop_ev, 0 ));
     CALL(cudaEventSynchronize(stop_ev));
 
@@ -164,8 +192,10 @@ float bench_memread_kernel(void * B, void * A, int64_t dwords)
     return ms;
 }
 
-int run(int64_t dwords)
+template<int need_bin = 0>
+int run(int rows, int cols, int stride)
 {
+    int64_t dwords = static_cast<int64_t>(rows) * stride;
     unsigned char *A, *B;
     
     float * h_A = (float*)malloc(dwords*sizeof(float));
@@ -177,15 +207,17 @@ int run(int64_t dwords)
     CALL(cudaMalloc(&B, dwords * sizeof(float)));
     CALL(cudaMemcpy(A, h_A, dwords * sizeof(float), cudaMemcpyHostToDevice));
 
-    float ms = bench_memread_kernel<fp32x4, 1, 4>(B, A, dwords);
+    float ms = bench_memread_kernel<float, 1, need_bin>(B, A, rows, cols, stride);
 
-
-    auto get_gbps = [](int64_t dwords_, float ms_){
+    auto get_gbps = [](int rows_, int cols_, float ms_){
+        int64_t dwords_ = static_cast<int64_t>(rows_) * cols_;
         return  ((double)dwords_*sizeof(float))/((double)ms_/1000)/1000000000.0;
     };
     char str[64];
     b2s(dwords*sizeof(float), str);
-    printf("%9s -> %.4fms, %.3f(GB/s)\n", str, ms, get_gbps(dwords, ms));
+    printf("[%4dx%4d]%9s -> %.4fms, %.3f(GB/s), %s\n",rows, cols, str, ms, get_gbps(rows, cols, ms),
+        need_bin ? "atomic_smem" : "no_smem"
+    );
 
     free(h_A);
     free(h_B);
@@ -194,38 +226,35 @@ int run(int64_t dwords)
     return 0;
 }
 
+struct bench_data {
+    int rows;
+    int cols;
+};
+
 int main(int argc, char ** argv) {
     CALL(cudaSetDevice(0));
-    if(argc > 1){
-        int64_t dwords = atoll(argv[1]);
-        run(dwords);
+    if(argc > 2){
+        int rows = atoi(argv[1]);
+        int cols = atoi(argv[2]);
+        run<0>(rows, cols, cols);
+        run<1>(rows, cols, cols);
     } else {
-        int num_cu = [&](){
-            cudaDeviceProp dev_prop;
-            int dev;
-            CALL(cudaGetDevice(&dev));
-            CALL(cudaGetDeviceProperties(&dev_prop,dev ));
-            return dev_prop.multiProcessorCount;
-        }();
-        printf("cu:%d\n", num_cu);
-
-        int64_t dwords_list[] = {
-            20000,
-            400000,
-            static_cast<int64_t>(116) * num_cu * BLOCK_SIZE,
-            static_cast<int64_t>(212) * num_cu * BLOCK_SIZE,
-            static_cast<int64_t>(476) * num_cu * BLOCK_SIZE,
-            static_cast<int64_t>(820) * num_cu * BLOCK_SIZE,
-            static_cast<int64_t>(1638) * num_cu * BLOCK_SIZE,
-            static_cast<int64_t>(3276) * num_cu * BLOCK_SIZE,
-            static_cast<int64_t>(12032) * num_cu * BLOCK_SIZE};
+#if 1
+        bench_data dwords_list[] = {
+            {320, 16384},
+            {3200, 16384},
+            {16384, 16384}};
 
         int iters = sizeof(dwords_list) / sizeof(dwords_list[0]);
 
         for(auto i = 0; i < iters; i++) {
-            int64_t dwords = dwords_list[i];
-            run(dwords);
+            int rows = dwords_list[i].rows;
+            int cols = dwords_list[i].cols;
+            run<0>(rows, cols, cols);
+            usleep(100000);
+            run<1>(rows, cols, cols);
             usleep(100000);
         }
+#endif
     }
 }
