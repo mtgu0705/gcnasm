@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <chrono>
 
 #ifdef __NVCC__
 using fp32 =  float;
@@ -22,6 +23,10 @@ using fp32x4 = __attribute__((__ext_vector_type__(4))) float;
 #define USE_NT_LOAD 1
 #endif
 
+#ifndef USE_NT_STORE
+#define USE_NT_STORE 1
+#endif
+
 #if USE_NT_LOAD
 template<typename T>
 __device__ __forceinline__ T nt_load(const T& ref)
@@ -33,6 +38,19 @@ __device__ __forceinline__ T nt_load(const T& ref)
 #endif
 }
 #endif
+
+#if USE_NT_STORE
+template<typename T>
+__device__ __forceinline__ void nt_store(const T& value, T* addr)
+{
+#ifdef __HIPCC__
+    __builtin_nontemporal_store(value, addr);
+#else
+    *addr = value;
+#endif
+}
+#endif
+
 
 template<typename T>
 __device__  __forceinline__ void acc(T& v, const T& other)
@@ -73,6 +91,36 @@ void memread_kernel(T* p_src, T* p_dst, int issues_per_block, int iters)
     }
 }
 
+template<typename T, int UNROLL = 8>
+__global__
+void memcpy_kernel(T* p_src, T* p_dst, int issues_per_block, int iters)
+{
+    auto current = blockIdx.x * issues_per_block;
+    T v {};
+    for(auto i = 0; i < iters; i++) {
+        auto offs = UNROLL * BLOCK_SIZE * i + threadIdx.x;
+        T tmp[UNROLL];
+
+        #pragma unroll
+        for(auto j = 0; j < UNROLL; j++) {
+#if USE_NT_LOAD
+            tmp[j] = nt_load(p_src[current + offs + j * BLOCK_SIZE]);
+#else
+            tmp[j] = p_src[current + offs + j * BLOCK_SIZE];
+#endif
+        }
+
+        #pragma unroll
+        for(auto j = 0; j < UNROLL; j++) {
+#if USE_NT_STORE
+            nt_store(tmp[j], p_dst + current + offs + j * BLOCK_SIZE);
+#else
+            p_dst[current + offs + j * BLOCK_SIZE] = tmp[j];
+#endif
+        }
+    }
+}
+
 #define CALL(cmd) \
 do {\
     cudaError_t cuda_error  = cmd;\
@@ -84,6 +132,42 @@ do {\
 
 #define WARMUP 25
 #define LOOP 100
+
+// ---------------------------------------------------------------------------
+// Timer classes
+// ---------------------------------------------------------------------------
+
+struct gpu_timer {
+    cudaEvent_t start_ev, stop_ev;
+    gpu_timer() {
+        CALL(cudaEventCreate(&start_ev));
+        CALL(cudaEventCreate(&stop_ev));
+    }
+    ~gpu_timer() {
+        (void)cudaEventDestroy(start_ev);
+        (void)cudaEventDestroy(stop_ev);
+    }
+    void start() { CALL(cudaEventRecord(start_ev, 0)); }
+    void stop()  { CALL(cudaEventRecord(stop_ev, 0)); CALL(cudaEventSynchronize(stop_ev)); }
+    float get()  { float ms; CALL(cudaEventElapsedTime(&ms, start_ev, stop_ev)); return ms; }
+};
+
+struct cpu_timer {
+    std::chrono::time_point<std::chrono::high_resolution_clock> t_start, t_stop;
+    void start() {
+        CALL(cudaDeviceSynchronize());
+        t_start = std::chrono::high_resolution_clock::now();
+    }
+    void stop() {
+        CALL(cudaDeviceSynchronize());
+        t_stop = std::chrono::high_resolution_clock::now();
+    }
+    float get() {
+        return std::chrono::duration<float, std::milli>(t_stop - t_start).count();
+    }
+};
+
+// ---------------------------------------------------------------------------
 
 static inline void b2s(size_t bytes, char * str){
 	if(bytes<1024){
@@ -126,8 +210,8 @@ static inline int valid_vec(const float * vec_a, const float * vec_b, int num)
     return err_cnt;
 }
 
-template<typename VEC, int OCCUPANCY, int UNROLL>
-float bench_memread_kernel(void * B, void * A, int64_t dwords)
+template<typename VEC, int OCCUPANCY, int UNROLL, int kernel_id = 0>
+float bench_kernel(void * B, void * A, int64_t dwords, bool use_cpu_timer = false)
 {
     // benchmark kernel
     int num_cu = [&](){
@@ -145,29 +229,42 @@ float bench_memread_kernel(void * B, void * A, int64_t dwords)
     int issues_per_block = pixels / gx;
     int iters = issues_per_block / bx / UNROLL;
 
-    cudaEvent_t start_ev, stop_ev;
-    CALL(cudaEventCreate(&start_ev));
-    CALL(cudaEventCreate(&stop_ev));
+    auto run_kernels = [&](int count) {
+        if constexpr (kernel_id == 0) {
+            for(int i = 0; i < count; i++)
+                memread_kernel<VEC, UNROLL><<<gx, bx>>>(reinterpret_cast<VEC*>(B), reinterpret_cast<VEC*>(A), issues_per_block, iters);
+        } else if constexpr (kernel_id == 1) {
+            for(int i = 0; i < count; i++)
+                memcpy_kernel<VEC, UNROLL><<<gx, bx>>>(reinterpret_cast<VEC*>(B), reinterpret_cast<VEC*>(A), issues_per_block, iters);
+        }
+    };
 
-    for(int i=0;i<WARMUP;i++)
-        memread_kernel<VEC, UNROLL><<<gx, bx>>>(reinterpret_cast<VEC*>(B), reinterpret_cast<VEC*>(A), issues_per_block, iters);
-
-    CALL(cudaEventRecord(start_ev, 0));
-    for(int i=0;i<LOOP;i++)
-        memread_kernel<VEC, UNROLL><<<gx, bx>>>(reinterpret_cast<VEC*>(B), reinterpret_cast<VEC*>(A), issues_per_block, iters);
-    CALL(cudaEventRecord( stop_ev, 0 ));
-    CALL(cudaEventSynchronize(stop_ev));
+    run_kernels(WARMUP);
 
     float ms;
-    CALL(cudaEventElapsedTime(&ms,start_ev, stop_ev));
-    ms/=LOOP;
+    if (use_cpu_timer) {
+        cpu_timer timer;
+        timer.start();
+        run_kernels(LOOP);
+        timer.stop();
+        ms = timer.get();
+    } else {
+        gpu_timer timer;
+        timer.start();
+        run_kernels(LOOP);
+        timer.stop();
+        ms = timer.get();
+    }
+
+    ms /= LOOP;
     return ms;
 }
 
-int run(int64_t dwords)
+template<int kernel_id = 0>
+int run(int64_t dwords, bool use_cpu_timer)
 {
     unsigned char *A, *B;
-    
+
     float * h_A = (float*)malloc(dwords*sizeof(float));
     float * h_B = (float*)malloc(dwords*sizeof(float));
 	for (int i = 0; i < dwords; ++i)
@@ -177,15 +274,15 @@ int run(int64_t dwords)
     CALL(cudaMalloc(&B, dwords * sizeof(float)));
     CALL(cudaMemcpy(A, h_A, dwords * sizeof(float), cudaMemcpyHostToDevice));
 
-    float ms = bench_memread_kernel<fp32x4, 1, 4>(B, A, dwords);
-
+    float ms = bench_kernel<fp32x4, 1, 4, kernel_id>(B, A, dwords, use_cpu_timer);
 
     auto get_gbps = [](int64_t dwords_, float ms_){
         return  ((double)dwords_*sizeof(float))/((double)ms_/1000)/1000000000.0;
     };
     char str[64];
     b2s(dwords*sizeof(float), str);
-    printf("%9s -> %.4fms, %.3f(GB/s)\n", str, ms, get_gbps(dwords, ms));
+    printf("%9s(%s) -> %.4fms, %.3f(GB/s)\n", str, kernel_id == 0 ? "[ro]" : "[rw]",
+        ms, get_gbps(dwords * (kernel_id == 0 ? 1 : 2), ms));
 
     free(h_A);
     free(h_B);
@@ -196,10 +293,15 @@ int run(int64_t dwords)
 
 int main(int argc, char ** argv) {
     CALL(cudaSetDevice(0));
+
+    bool use_cpu_timer = env_get_int("USE_CPU_TIMER", 0) != 0;
+
     if(argc > 1){
         int64_t dwords = atoll(argv[1]);
-        run(dwords);
+        run(dwords, use_cpu_timer);
     } else {
+        int btc = env_get_int("BANDWIDTH_TEST_CASE", 0);
+        int list = env_get_int("BANDWIDTH_TEST_LIST", 0);
         int num_cu = [&](){
             cudaDeviceProp dev_prop;
             int dev;
@@ -207,25 +309,58 @@ int main(int argc, char ** argv) {
             CALL(cudaGetDeviceProperties(&dev_prop,dev ));
             return dev_prop.multiProcessorCount;
         }();
-        printf("cu:%d\n", num_cu);
 
-        int64_t dwords_list[] = {
+        printf("cu:%d, nt_load:%d, nt_store:%d (%d) timer:%s\n",
+            num_cu, USE_NT_LOAD, USE_NT_STORE, btc,
+            use_cpu_timer ? "cpu" : "gpu");
+        num_cu = btc == 0 ? num_cu : (btc == -1 ? 304 : btc);
+
+        int64_t dwords_list_1[] = {
             20000,
             400000,
+            16711680,
             static_cast<int64_t>(116) * num_cu * BLOCK_SIZE,
             static_cast<int64_t>(212) * num_cu * BLOCK_SIZE,
             static_cast<int64_t>(476) * num_cu * BLOCK_SIZE,
             static_cast<int64_t>(820) * num_cu * BLOCK_SIZE,
+            static_cast<int64_t>(1024) * num_cu * BLOCK_SIZE,
             static_cast<int64_t>(1638) * num_cu * BLOCK_SIZE,
             static_cast<int64_t>(3276) * num_cu * BLOCK_SIZE,
-            static_cast<int64_t>(12032) * num_cu * BLOCK_SIZE};
+            static_cast<int64_t>(5710) * num_cu * BLOCK_SIZE
+            // static_cast<int64_t>(12032) * num_cu * BLOCK_SIZE
+        };
 
-        int iters = sizeof(dwords_list) / sizeof(dwords_list[0]);
+        int64_t dwords_list_2[] = {
+            20000,
+            400000,
+            16711680,
+            static_cast<int64_t>(10032 * 3) * BLOCK_SIZE,
+            static_cast<int64_t>(10032 * 6) * BLOCK_SIZE,
+            static_cast<int64_t>(10032 * 14) * BLOCK_SIZE,
+            static_cast<int64_t>(10032 * 25) * BLOCK_SIZE,
+            static_cast<int64_t>(10032 * 38) * BLOCK_SIZE,
+            static_cast<int64_t>(10032 * 54) * BLOCK_SIZE,
+            static_cast<int64_t>(10032 * 95) * BLOCK_SIZE,
+            static_cast<int64_t>(10032 * 158) * BLOCK_SIZE
+            // static_cast<int64_t>(12032) * num_cu * BLOCK_SIZE
+        };
 
+        int64_t * dwords_list = list == 2 ? dwords_list_2 : dwords_list_1;
+
+        int iters = sizeof(dwords_list_1) / sizeof(dwords_list_1[0]);
+
+        printf("---------------------------------------------\n");
         for(auto i = 0; i < iters; i++) {
             int64_t dwords = dwords_list[i];
-            run(dwords);
-            usleep(100000);
+            run<0>(dwords, use_cpu_timer);
+            usleep(200000);
+        }
+        printf("---------------------------------------------\n");
+        usleep(200000 * 10);
+        for(auto i = 0; i < iters; i++) {
+            int64_t dwords = dwords_list[i];
+            run<1>(dwords, use_cpu_timer);
+            usleep(200000);
         }
     }
 }
